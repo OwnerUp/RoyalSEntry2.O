@@ -620,9 +620,14 @@ async def startup(app: Application) -> None:
 def main() -> None:
     load_database()
 
+    # Timeouts are configured on the ApplicationBuilder in PTB v20+
     app = (
         ApplicationBuilder()
         .token(TOKEN)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(60)
+        .pool_timeout(60)
         .post_init(startup)
         .build()
     )
@@ -639,14 +644,10 @@ def main() -> None:
     app.add_handler(ChatMemberHandler(bot_membership_changed, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, owner_text_handler))
 
+    # run_polling only takes polling-specific parameters
     app.run_polling(
         allowed_updates=["message", "callback_query", "chat_join_request", "my_chat_member"],
         drop_pending_updates=False,
-        timeout=60,
-        read_timeout=60,
-        write_timeout=60,
-        connect_timeout=60,
-        pool_timeout=60,
     )
 
 if __name__ == "__main__":
