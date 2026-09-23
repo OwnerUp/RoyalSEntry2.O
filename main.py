@@ -1,12 +1,13 @@
-import asyncio
-import json
-import logging
 import os
+import sys
+import json
 import random
+import asyncio
+import logging
 import tempfile
-from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from datetime import datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
@@ -26,12 +27,12 @@ from telegram.ext import (
 # CONFIGURATION
 # =====================================================
 
-TOKEN = "8932896459:AAH5Y_u8VjjdZUPACvSmDtYd0ZRZzjOcCBI"
-OWNER_ID = 5059296601
+TOKEN = os.getenv("TOKEN", "8932896459:AAH5Y_u8VjjdZUPACvSmDtYd0ZRZzjOcCBI")
+OWNER_ID = int(os.getenv("OWNER_ID", "5059296601"))
 IST = ZoneInfo("Asia/Kolkata")
 DB_FILE = Path("queue_data.json")
 
-BOT_VERSION = "v5.0"
+BOT_VERSION = "v5.1-Stable"
 LAST_UPDATE_TIME = datetime.now(IST)
 
 DAILY_MIN = 70
@@ -39,9 +40,11 @@ DAILY_MAX = 90
 DELAY_MIN = 1
 DELAY_MAX = 180
 
+# sys.stdout lagane se Railway par red line nahi aayegi
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -55,7 +58,7 @@ channel_queues: dict[str, list[dict]] = {}
 channel_stats: dict[str, dict] = {}
 channel_settings: dict[str, dict] = {}
 admin_notices: set[str] = set()
-running_workers: set[str] = set()
+running_worker_tasks: dict[str, asyncio.Task] = {}
 owner_inputs: dict[int, tuple[str, str]] = {}
 last_reset_date = datetime.now(IST).date()
 
@@ -78,7 +81,7 @@ async def owner_notice(context: ContextTypes.DEFAULT_TYPE | Application, text: s
     try:
         await bot.send_message(chat_id=OWNER_ID, text=text, parse_mode="Markdown")
     except TelegramError:
-        log.warning("Owner ko notification nahi bheja ja saka. Pehle bot me /start karein.")
+        log.warning("Owner ko notification nahi bheja ja saka.")
 
 def status_label(cid: str) -> str:
     config = channel_settings.get(cid, {})
@@ -102,13 +105,13 @@ def channels_keyboard() -> InlineKeyboardMarkup:
         config = channel_settings.get(cid, {})
         icon = "🟢" if config.get("enabled", True) and config.get("can_approve", False) else "🔴"
         title = config.get("title", cid)
-        rows.append([InlineKeyboardButton(f"{icon} {title[:30]}", callback_data=f"channel:{cid}")])
+        rows.append([InlineKeyboardButton(f"{icon} {title[:28]}", callback_data=f"channel:{cid}")])
     rows.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
 def channel_keyboard(cid: str) -> InlineKeyboardMarkup:
-    config = channel_settings[cid]
-    toggle = "⏸ Stop (Turn OFF)" if config["enabled"] else "▶️ Start (Turn ON)"
+    config = channel_settings.get(cid, {})
+    toggle = "⏸ Stop (Turn OFF)" if config.get("enabled", True) else "▶️ Start (Turn ON)"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(toggle, callback_data=f"toggle:{cid}")],
         [InlineKeyboardButton("🎯 Set Daily Limit", callback_data=f"limit:{cid}"),
@@ -117,15 +120,15 @@ def channel_keyboard(cid: str) -> InlineKeyboardMarkup:
     ])
 
 def channel_details(cid: str) -> str:
-    config = channel_settings[cid]
-    stats = channel_stats[cid]
+    config = channel_settings.get(cid, {})
+    stats = channel_stats.get(cid, {})
     return (
-        f"📢 *Channel:* {config['title']}\n"
+        f"📢 *Channel:* {config.get('title', cid)}\n"
         f"🆔 *ID:* `{cid}`\n"
         f"⚡ *Status:* {status_label(cid)}\n"
-        f"📊 *Approved Today:* {stats['approved_today']} / {stats['daily_limit']}\n"
-        f"🎯 *Daily Range:* {config['daily_min']} – {config['daily_max']}\n"
-        f"⏱ *Delay Range:* {config['delay_min']} – {config['delay_max']} min\n"
+        f"📊 *Approved Today:* {stats.get('approved_today', 0)} / {stats.get('daily_limit', DAILY_MAX)}\n"
+        f"🎯 *Daily Range:* {config.get('daily_min', DAILY_MIN)} – {config.get('daily_max', DAILY_MAX)}\n"
+        f"⏱ *Delay Range:* {config.get('delay_min', DELAY_MIN)} – {config.get('delay_max', DELAY_MAX)} min\n"
         f"👥 *Queue:* {len(channel_queues.get(cid, []))}"
     )
 
@@ -133,8 +136,8 @@ def help_text() -> str:
     return (
         "🛠 *Owner Commands:*\n\n"
         "• `/channels` — Channels list aur controls\n"
-        "• `/on CHANNEL_ID` — Channel me auto-accept shuru karein\n"
-        "• `/off CHANNEL_ID` — Channel me auto-accept band karein\n"
+        "• `/on CHANNEL_ID` — Auto-accept shuru karein\n"
+        "• `/off CHANNEL_ID` — Auto-accept band karein\n"
         "• `/limit CHANNEL_ID MIN MAX` — Daily target limit set karein\n"
         "• `/delay CHANNEL_ID MIN MAX` — Delay range minutes set karein\n"
         "• `/myid` — Apna user ID check karein"
@@ -145,31 +148,32 @@ def help_text() -> str:
 # =====================================================
 
 def save_database() -> None:
-    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
-    data = {
-        "queues": channel_queues,
-        "channel_stats": channel_stats,
-        "channel_settings": channel_settings,
-        "admin_notices": sorted(admin_notices),
-    }
-    fd, temp_name = tempfile.mkstemp(prefix="queue_data_", suffix=".tmp", dir=str(DB_FILE.parent))
     try:
+        DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "queues": channel_queues,
+            "channel_stats": channel_stats,
+            "channel_settings": channel_settings,
+            "admin_notices": sorted(list(admin_notices)),
+        }
+        fd, temp_name = tempfile.mkstemp(prefix="queue_data_", suffix=".tmp", dir=str(DB_FILE.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp_name, DB_FILE)
-    finally:
-        if os.path.exists(temp_name):
-            os.unlink(temp_name)
+    except Exception as e:
+        log.error(f"Save DB Error: {e}")
 
 def ensure_channel(channel_id: str | int, title: str | None = None, *, can_approve: bool | None = None) -> str:
     cid = str(channel_id)
     channel_queues.setdefault(cid, [])
     settings = channel_settings.setdefault(cid, {})
-    settings.setdefault("title", title or cid)
     if title:
         settings["title"] = title
+    else:
+        settings.setdefault("title", cid)
+
     settings.setdefault("enabled", True)
     settings.setdefault("can_approve", False)
     settings.setdefault("daily_min", DAILY_MIN)
@@ -233,9 +237,9 @@ def get_dynamic_delay(channel_id: str) -> int:
     now = now_local()
     current_hour = now.hour
     pending_users = total_pending_users()
-    stats = channel_stats[channel_id]
-    approved_today = stats["approved_today"]
-    daily_limit = stats["daily_limit"]
+    stats = channel_stats.get(channel_id, {})
+    approved_today = stats.get("approved_today", 0)
+    daily_limit = stats.get("daily_limit", DAILY_MAX)
 
     if current_hour < 13:
         target_now = 40
@@ -261,9 +265,9 @@ def get_dynamic_delay(channel_id: str) -> int:
         else:
             choices = [3600, 5400, 7200, 10800]
 
-    settings = channel_settings[channel_id]
-    low = settings["delay_min"] * 60
-    high = settings["delay_max"] * 60
+    settings = channel_settings.get(channel_id, {})
+    low = settings.get("delay_min", DELAY_MIN) * 60
+    high = settings.get("delay_max", DELAY_MAX) * 60
     usable = [d for d in choices if low <= d <= high]
     if usable:
         return random.choice(usable)
@@ -275,79 +279,86 @@ def get_dynamic_delay(channel_id: str) -> int:
 
 def ensure_worker(channel_id: str | int, app: Application) -> None:
     cid = str(channel_id)
-    if cid in running_workers:
+    existing_task = running_worker_tasks.get(cid)
+    if existing_task and not existing_task.done():
         return
-    running_workers.add(cid)
+
     task = asyncio.create_task(channel_worker(cid, app))
+    running_worker_tasks[cid] = task
 
-    def done(_task: asyncio.Task) -> None:
-        running_workers.discard(cid)
-        if not _task.cancelled() and _task.exception():
-            log.exception("Worker band hua channel %s", cid, exc_info=_task.exception())
+    def done_callback(t: asyncio.Task) -> None:
+        if not t.cancelled() and t.exception():
+            log.warning(f"Worker for {cid} exited with exception: {t.exception()}. Will revive on next update.")
 
-    task.add_done_callback(done)
+    task.add_done_callback(done_callback)
 
 async def channel_worker(channel_id: str, app: Application) -> None:
     while True:
-        reset_daily()
-        config = channel_settings.get(channel_id)
-        if not config or not config["enabled"] or not config["can_approve"]:
-            await asyncio.sleep(15)
-            continue
-
-        stats = channel_stats[channel_id]
-        queue = channel_queues.setdefault(channel_id, [])
-
-        if stats["approved_today"] >= stats["daily_limit"]:
-            log.info("[%s] Daily Limit Reached %s/%s", channel_id, stats["approved_today"], stats["daily_limit"])
-            await asyncio.sleep(600)
-            continue
-
-        if not queue:
-            await asyncio.sleep(30)
-            continue
-
-        item = queue[0]
-        delay = get_dynamic_delay(channel_id)
-        minutes = round(delay / 60, 1)
-
-        log.info("[%s] %s waiting %s min | Queue: %s", config["title"], item.get("user_name", item["user_id"]), minutes, total_pending_users())
-        await asyncio.sleep(delay)
-
-        config = channel_settings.get(channel_id)
-        if not config or not config["enabled"] or not config["can_approve"]:
-            continue
-
-        reset_daily()
-        stats = channel_stats[channel_id]
-        if stats["approved_today"] >= stats["daily_limit"]:
-            continue
-
         try:
-            await app.bot.approve_chat_join_request(chat_id=int(channel_id), user_id=int(item["user_id"]))
-            if queue and int(queue[0]["user_id"]) == int(item["user_id"]):
-                queue.pop(0)
-            stats["approved_today"] += 1
-            save_database()
-            log.info("✅ Approved %s in %s | Today: %s/%s", item.get("user_name"), config["title"], stats["approved_today"], stats["daily_limit"])
-        except RetryAfter as exc:
-            wait_time = int(exc.retry_after)
-            log.warning("FloodWait %ss for %s", wait_time, channel_id)
-            await asyncio.sleep(wait_time + 1)
-        except Forbidden:
-            config["can_approve"] = False
-            save_database()
-            await owner_notice(app, f"🔴 *Permission Removed!*\nChannel: {config['title']} (`{channel_id}`)\nBot ko admin permission wapas dein.")
-            await asyncio.sleep(15)
-        except (TimedOut, NetworkError):
-            await asyncio.sleep(60)
-        except BadRequest as e:
-            if queue and int(queue[0]["user_id"]) == int(item["user_id"]):
-                queue.pop(0)
-            save_database()
-            log.info("Skipped stale request in %s: %s", config["title"], e)
-        except TelegramError:
-            await asyncio.sleep(60)
+            reset_daily()
+            config = channel_settings.get(channel_id)
+            if not config or not config.get("enabled", True) or not config.get("can_approve", False):
+                await asyncio.sleep(20)
+                continue
+
+            stats = channel_stats.get(channel_id, {})
+            queue = channel_queues.setdefault(channel_id, [])
+
+            if stats.get("approved_today", 0) >= stats.get("daily_limit", DAILY_MAX):
+                await asyncio.sleep(300)
+                continue
+
+            if not queue:
+                await asyncio.sleep(25)
+                continue
+
+            item = queue[0]
+            delay = get_dynamic_delay(channel_id)
+            minutes = round(delay / 60, 1)
+
+            log.info("[%s] %s waiting %s min | Queue: %s", config.get("title", channel_id), item.get("user_name", item.get("user_id")), minutes, total_pending_users())
+            await asyncio.sleep(delay)
+
+            config = channel_settings.get(channel_id)
+            if not config or not config.get("enabled", True) or not config.get("can_approve", False):
+                continue
+
+            reset_daily()
+            stats = channel_stats.get(channel_id, {})
+            if stats.get("approved_today", 0) >= stats.get("daily_limit", DAILY_MAX):
+                continue
+
+            try:
+                await app.bot.approve_chat_join_request(chat_id=int(channel_id), user_id=int(item["user_id"]))
+                if queue and int(queue[0].get("user_id", 0)) == int(item["user_id"]):
+                    queue.pop(0)
+                stats["approved_today"] = stats.get("approved_today", 0) + 1
+                save_database()
+                log.info("✅ Approved %s in %s | Today: %s/%s", item.get("user_name"), config.get("title"), stats["approved_today"], stats["daily_limit"])
+            except RetryAfter as exc:
+                wait_time = int(exc.retry_after)
+                log.warning("FloodWait %ss for %s", wait_time, channel_id)
+                await asyncio.sleep(wait_time + 1)
+            except Forbidden:
+                config["can_approve"] = False
+                save_database()
+                await owner_notice(app, f"🔴 *Permission Removed!*\nChannel: {config.get('title')} (`{channel_id}`)\nBot ko admin permission wapas dein.")
+                await asyncio.sleep(20)
+            except (TimedOut, NetworkError):
+                await asyncio.sleep(30)
+            except BadRequest as e:
+                if queue and int(queue[0].get("user_id", 0)) == int(item["user_id"]):
+                    queue.pop(0)
+                save_database()
+                log.info("Skipped stale request in %s: %s", config.get("title"), e)
+            except TelegramError as te:
+                log.warning("Telegram error in %s: %s", channel_id, te)
+                await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error(f"Worker unhandled error in {channel_id}: {e}")
+            await asyncio.sleep(10)
 
 # =====================================================
 # HANDLERS
@@ -407,7 +418,7 @@ async def bot_membership_changed(update: Update, context: ContextTypes.DEFAULT_T
     ensure_channel(cid, chat.title, can_approve=can_approve)
     save_database()
 
-    if can_approve and channel_settings[cid]["enabled"]:
+    if can_approve and channel_settings[cid].get("enabled", True):
         ensure_worker(cid, context.application)
 
     if not was_admin:
@@ -420,8 +431,7 @@ async def bot_membership_changed(update: Update, context: ContextTypes.DEFAULT_T
                 f"📢 *Channel:* {chat.title or cid}\n"
                 f"🆔 *Channel ID:* `{cid}`\n"
                 f"✅ *Permission:* Approve requests OK\n"
-                f"⚡ *Auto-Accept:* Chalu ho gaya\n\n"
-                f"Band karne ke liye command: `/off {cid}`"
+                f"⚡ *Auto-Accept:* Chalu ho gaya"
             )
         else:
             notice = (
@@ -436,7 +446,7 @@ async def bot_membership_changed(update: Update, context: ContextTypes.DEFAULT_T
         await owner_notice(context, f"✅ *Permission Granted!*\n📢 *Channel:* {chat.title or cid} (`{cid}`)\nApprove requests permission mil gayi hai.")
 
 # =====================================================
-# COMMANDS
+# COMMANDS & CALLBACKS
 # =====================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -532,34 +542,40 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
     data = query.data or ""
 
-    if data == "home":
-        await query.edit_message_text("🎛 Control Panel:", reply_markup=main_keyboard())
-    elif data == "help":
-        await query.edit_message_text(help_text(), reply_markup=main_keyboard(), parse_mode="Markdown")
-    elif data == "channels":
-        if channel_ids():
-            await query.edit_message_text("Channel chunein:", reply_markup=channels_keyboard())
+    try:
+        if data == "home":
+            await query.edit_message_text("🎛 Control Panel:", reply_markup=main_keyboard())
+        elif data == "help":
+            await query.edit_message_text(help_text(), reply_markup=main_keyboard(), parse_mode="Markdown")
+        elif data == "channels":
+            if channel_ids():
+                await query.edit_message_text("Channel chunein:", reply_markup=channels_keyboard())
+            else:
+                await query.edit_message_text("Abhi tak koi channel registered nahi hai.", reply_markup=main_keyboard())
+        elif data.startswith("channel:"):
+            cid = data.split(":", 1)[1]
+            if cid in channel_settings:
+                await query.edit_message_text(channel_details(cid), reply_markup=channel_keyboard(cid), parse_mode="Markdown")
+        elif data.startswith("toggle:"):
+            cid = data.split(":", 1)[1]
+            if cid in channel_settings:
+                channel_settings[cid]["enabled"] = not channel_settings[cid]["enabled"]
+                save_database()
+                if channel_settings[cid]["enabled"] and channel_settings[cid]["can_approve"]:
+                    ensure_worker(cid, context.application)
+                await query.edit_message_text(channel_details(cid), reply_markup=channel_keyboard(cid), parse_mode="Markdown")
+        elif data.startswith("limit:") or data.startswith("delay:"):
+            kind, cid = data.split(":", 1)
+            if cid not in channel_settings:
+                return
+            owner_inputs[OWNER_ID] = (kind, cid)
+            sample = "70 90" if kind == "limit" else "5 30"
+            await query.message.reply_text(f"*{channel_settings[cid]['title']}* ke liye MIN MAX numbers space ke saath bhejein.\nExample: `{sample}`", parse_mode="Markdown")
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            pass  # Ignore harmless duplicate clicks
         else:
-            await query.edit_message_text("Abhi tak koi channel registered nahi hai.", reply_markup=main_keyboard())
-    elif data.startswith("channel:"):
-        cid = data.split(":", 1)[1]
-        if cid in channel_settings:
-            await query.edit_message_text(channel_details(cid), reply_markup=channel_keyboard(cid), parse_mode="Markdown")
-    elif data.startswith("toggle:"):
-        cid = data.split(":", 1)[1]
-        if cid in channel_settings:
-            channel_settings[cid]["enabled"] = not channel_settings[cid]["enabled"]
-            save_database()
-            if channel_settings[cid]["enabled"] and channel_settings[cid]["can_approve"]:
-                ensure_worker(cid, context.application)
-            await query.edit_message_text(channel_details(cid), reply_markup=channel_keyboard(cid), parse_mode="Markdown")
-    elif data.startswith("limit:") or data.startswith("delay:"):
-        kind, cid = data.split(":", 1)
-        if cid not in channel_settings:
-            return
-        owner_inputs[OWNER_ID] = (kind, cid)
-        sample = "70 90" if kind == "limit" else "5 30"
-        await query.message.reply_text(f"*{channel_settings[cid]['title']}* ke liye MIN MAX numbers space ke saath bhejein.\nExample: `{sample}`", parse_mode="Markdown")
+            raise e
 
 async def owner_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update) or not update.effective_message or not update.effective_message.text:
@@ -594,6 +610,12 @@ async def owner_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     save_database()
     await update.effective_message.reply_text(f"✅ *{config['title']}*: {label} range `{low}`–`{high}` set ho gaya.", reply_markup=channel_keyboard(cid), parse_mode="Markdown")
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unhandled exceptions handle karega taaki bot crash na ho."""
+    if isinstance(context.error, BadRequest) and "Message is not modified" in str(context.error):
+        return
+    log.error(f"Exception while handling update: {context.error}")
+
 # =====================================================
 # STARTUP & MAIN
 # =====================================================
@@ -620,7 +642,6 @@ async def startup(app: Application) -> None:
 def main() -> None:
     load_database()
 
-    # Timeouts are configured on the ApplicationBuilder in PTB v20+
     app = (
         ApplicationBuilder()
         .token(TOKEN)
@@ -643,11 +664,12 @@ def main() -> None:
     app.add_handler(ChatJoinRequestHandler(handle_request))
     app.add_handler(ChatMemberHandler(bot_membership_changed, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, owner_text_handler))
+    app.add_error_handler(global_error_handler)
 
-    # run_polling only takes polling-specific parameters
+    # drop_pending_updates=True conflict aur crash se bachata hai
     app.run_polling(
         allowed_updates=["message", "callback_query", "chat_join_request", "my_chat_member"],
-        drop_pending_updates=False,
+        drop_pending_updates=True,
     )
 
 if __name__ == "__main__":
