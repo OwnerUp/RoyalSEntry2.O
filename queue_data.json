@@ -1,0 +1,33 @@
+{
+    "queues": {
+        "-1001687279553": [
+            {
+                "user_id": 8333664475,
+                "user_name": "Vivek",
+                "channel_name": "VIKRAM SINGH 🥷",
+                "created_at": "2026-09-23T12:03:50.475292+05:30"
+            }
+        ]
+    },
+    "channel_stats": {
+        "-1001687279553": {
+            "approved_today": 0,
+            "daily_limit": 73,
+            "date": "2026-09-23"
+        }
+    },
+    "channel_settings": {
+        "-1001687279553": {
+            "title": "VIKRAM SINGH 🥷",
+            "enabled": true,
+            "can_approve": true,
+            "daily_min": 70,
+            "daily_max": 90,
+            "delay_min": 1,
+            "delay_max": 180
+        }
+    },
+    "admin_notices": [
+        "-1001687279553"
+    ]
+}
