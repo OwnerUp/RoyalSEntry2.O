@@ -32,7 +32,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "5059296601"))
 IST = ZoneInfo("Asia/Kolkata")
 DB_FILE = Path("queue_data.json")
 
-BOT_VERSION = "v5.1-Stable"
+BOT_VERSION = "v5.3-MultiChannel"
 LAST_UPDATE_TIME = datetime.now(IST)
 
 DAILY_MIN = 70
@@ -40,7 +40,6 @@ DAILY_MAX = 90
 DELAY_MIN = 1
 DELAY_MAX = 180
 
-# sys.stdout lagane se Railway par red line nahi aayegi
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -175,11 +174,12 @@ def ensure_channel(channel_id: str | int, title: str | None = None, *, can_appro
         settings.setdefault("title", cid)
 
     settings.setdefault("enabled", True)
-    settings.setdefault("can_approve", False)
+    settings.setdefault("can_approve", True if can_approve is None and "can_approve" not in settings else bool(can_approve))
     settings.setdefault("daily_min", DAILY_MIN)
     settings.setdefault("daily_max", DAILY_MAX)
     settings.setdefault("delay_min", DELAY_MIN)
     settings.setdefault("delay_max", DELAY_MAX)
+
     if can_approve is not None:
         settings["can_approve"] = bool(can_approve)
 
@@ -378,6 +378,7 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     queue = channel_queues[cid]
     if any(int(item.get("user_id", -1)) == request.from_user.id for item in queue):
+        ensure_worker(cid, context.application)
         return
 
     queue.append({
@@ -573,7 +574,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.message.reply_text(f"*{channel_settings[cid]['title']}* ke liye MIN MAX numbers space ke saath bhejein.\nExample: `{sample}`", parse_mode="Markdown")
     except BadRequest as e:
         if "Message is not modified" in str(e):
-            pass  # Ignore harmless duplicate clicks
+            pass
         else:
             raise e
 
@@ -611,7 +612,6 @@ async def owner_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.effective_message.reply_text(f"✅ *{config['title']}*: {label} range `{low}`–`{high}` set ho gaya.", reply_markup=channel_keyboard(cid), parse_mode="Markdown")
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Unhandled exceptions handle karega taaki bot crash na ho."""
     if isinstance(context.error, BadRequest) and "Message is not modified" in str(context.error):
         return
     log.error(f"Exception while handling update: {context.error}")
@@ -629,12 +629,15 @@ async def startup(app: Application) -> None:
             member = await app.bot.get_chat_member(int(cid), me.id)
             rights = (member.status == "administrator") and bool(getattr(member, "can_invite_users", False))
             config["can_approve"] = rights
-            if rights and config.get("enabled", True):
-                ensure_worker(cid, app)
-            save_database()
-        except TelegramError:
-            config["can_approve"] = False
-            save_database()
+        except Exception as e:
+            log.warning(f"Startup check note for {cid}: {e}. Retaining status.")
+            if "can_approve" not in config:
+                config["can_approve"] = True
+
+        save_database()
+        # Pehle se save queue ko continue karne ke liye worker start karein
+        if config.get("enabled", True):
+            ensure_worker(cid, app)
 
     if OWNER_ID > 0:
         await owner_notice(app, f"🚀 *Bot Online Hai!*\nVersion: {BOT_VERSION}\nControl Panel ke liye `/start` karein.")
@@ -666,10 +669,9 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, owner_text_handler))
     app.add_error_handler(global_error_handler)
 
-    # drop_pending_updates=True conflict aur crash se bachata hai
     app.run_polling(
         allowed_updates=["message", "callback_query", "chat_join_request", "my_chat_member"],
-        drop_pending_updates=True,
+        drop_pending_updates=False,
     )
 
 if __name__ == "__main__":
